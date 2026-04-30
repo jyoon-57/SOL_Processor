@@ -1,0 +1,19 @@
+# Environments
+venv/
+.env
+
+# Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Models (대용량 파일 제외)
+*.onnx
+*.pb
+*.task
+*.tflite
+*.h5
+
+# OS
+.DS_Store
+Thumbs.db
