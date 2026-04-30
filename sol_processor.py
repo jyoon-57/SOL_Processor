@@ -90,6 +90,7 @@ last_known_action = "None"    # 마지막으로 확인된 구체적인 행동
 
 # 움직임을 판단하는 기준점 (역치)
 MOVEMENT_THRESHOLD = 0.05 
+CONFIDENCE_THRESHOLD = 0.6 # AI의 추론 정확도가 60% 미만이면 무시 (찍기 방지)
 previous_landmarks = None # 바로 이전 장면의 관절 위치를 기억하는 변수
 
 # 디자이너님의 요청에 따른 관절별 민감도(가중치) 설정
@@ -200,9 +201,13 @@ while cap.isOpened():
             
             class_id = np.argmax(outputs)
             confidence = outputs[0][class_id]
-            last_known_action = labels[class_id]
             
-            print(f">> [새로운 맥락 발견] '{last_known_action}' 행동 감지! (정확도: {confidence:.2f})")
+            # 확신도(Confidence) 커트라인 검사 (찍기 방지)
+            if confidence >= CONFIDENCE_THRESHOLD:
+                last_known_action = labels[class_id]
+                print(f">> [새로운 맥락 발견] '{last_known_action}' 행동 감지! (정확도: {confidence:.2f})")
+            else:
+                print(f"-- [판단 보류] 정확도 미달 ({confidence:.2f} < {CONFIDENCE_THRESHOLD}). 기존 상태 유지.")
             
             # 추론 완료 후: 3. 버퍼를 비우고 상태를 다시 STABLE로 초기화 (중도 취소 방지 로직과 세트)
             frame_buffer.clear()
