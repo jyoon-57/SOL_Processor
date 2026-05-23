@@ -171,6 +171,7 @@ class ActionRecognizer:
         self.current_state = STATE_STABLE
         self.last_known_action = "None"
         self.display_action = "None"
+        self.lie_down_start_time = None
         self.previous_landmarks = None
         self.prev_time = 0
 
@@ -222,6 +223,7 @@ class ActionRecognizer:
             # 터미널 도배를 방지하기 위해, 상태가 변하는 최초 1회만 출력
             if self.last_known_action != "NO_HUMAN":
                 self.last_known_action = "NO_HUMAN"
+                self.lie_down_start_time = None
                 self.display_action = "NO HUMAN DETECTED"
                 print("-- [사용자 미확인] 화면에 사용자가 없습니다.")
                 
@@ -273,23 +275,40 @@ class ActionRecognizer:
                 
                 # 3. 관성(Sticky) 로직 적용
                 is_sticky = False
-                if self.last_known_action != "None" and self.last_known_action in mapped_probs:
-                    sticky_prob = mapped_probs[self.last_known_action]
+                
+                # SLEEP 상태일 때는 'LIE DOWN' 확률을 기준으로 관성을 계산
+                check_action_for_sticky = "LIE DOWN" if self.last_known_action == "SLEEP" else self.last_known_action
+                
+                if check_action_for_sticky != "None" and check_action_for_sticky in mapped_probs:
+                    sticky_prob = mapped_probs[check_action_for_sticky]
                     if sticky_prob >= STICKY_THRESHOLD:
                         is_sticky = True
-                        self.display_action = f"{self.last_known_action} (Sticky: {sticky_prob:.2f})"
-                        print(f"-- [관성 유지] 기존 행동 '{self.last_known_action}' 유지 중 (확률: {sticky_prob:.2f} >= {STICKY_THRESHOLD})")
+                        if self.last_known_action == "SLEEP":
+                            self.display_action = f"SLEEP (Sticky: {sticky_prob:.2f})"
+                            print(f"-- [관성 유지] 수면(SLEEP) 상태 유지 중 (LIE DOWN 확률: {sticky_prob:.2f} >= {STICKY_THRESHOLD})")
+                        else:
+                            self.display_action = f"{self.last_known_action} (Sticky: {sticky_prob:.2f})"
+                            print(f"-- [관성 유지] 기존 행동 '{self.last_known_action}' 유지 중 (확률: {sticky_prob:.2f} >= {STICKY_THRESHOLD})")
                 
                 # 4. 상태 전환 (Transition)
                 if not is_sticky:
                     if max_raw_prob >= CONFIDENCE_THRESHOLD:
                         if max_raw_action in ACTION_MAPPER:
                             mapped_action = ACTION_MAPPER[max_raw_action]
+                            
+                            # 추가된 시간 측정 로직 (LIE DOWN 상태 전환 체크)
+                            if self.last_known_action != mapped_action:
+                                if mapped_action == "LIE DOWN":
+                                    self.lie_down_start_time = time.time()
+                                else:
+                                    self.lie_down_start_time = None
+                            
                             self.last_known_action = mapped_action
                             self.display_action = mapped_action
                             print(f">> [상태 전환] '{max_raw_action}' -> '{mapped_action}' (정확도: {max_raw_prob:.2f})")
                         else:
                             self.last_known_action = "None"
+                            self.lie_down_start_time = None
                             self.display_action = f"IGNORE({max_raw_action})"
                             print(f"-- [행동 이탈] 무시된 행동 감지: '{max_raw_action}' (정확도: {max_raw_prob:.2f}). 기본 조명 상태로 복귀합니다.")
                     else:
@@ -298,6 +317,15 @@ class ActionRecognizer:
                 # 추론 완료 후: 3. 버퍼를 비우고 상태를 다시 STABLE로 초기화 (중도 취소 방지 로직과 세트)
                 self.frame_buffer.clear()
                 self.current_state = STATE_STABLE
+
+        # [수면(SLEEP) 전환 로직]
+        if self.last_known_action == "LIE DOWN" and self.lie_down_start_time is not None:
+            elapsed = time.time() - self.lie_down_start_time
+            if elapsed >= 600: # 10분(600초) 이상 유지
+                self.last_known_action = "SLEEP"
+                self.display_action = "SLEEP (Auto transition after 10m)"
+                self.lie_down_start_time = None
+                print(">> [자동 수면 전환] 10분 이상 'LIE DOWN' 상태 유지로 'SLEEP' 상태로 전환합니다.")
 
         # ==============================================================================
         # [화면 표시 정보] (모니터링용)

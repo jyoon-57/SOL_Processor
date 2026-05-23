@@ -3,6 +3,7 @@ import math
 import socket
 import threading
 import time
+import requests
 from astral import LocationInfo
 from astral.sun import sun
 from zoneinfo import ZoneInfo
@@ -21,9 +22,44 @@ class CircadianEngine:
         # 실시간 센서 조도값을 저장할 변수 (기본값 300.0)
         self.current_lux = 300.0
         
+        # 날씨 정보를 캐싱하기 위한 변수 (기본값: 맑음)
+        self.current_weather = "Clear"
+        
+        # 날씨 업데이트 데몬 스레드 시작 (30분 주기)
+        self._weather_thread = threading.Thread(target=self._weather_updater_thread, daemon=True)
+        self._weather_thread.start()
+
         # UDP 수신 데몬 스레드 시작
         self._listener_thread = threading.Thread(target=self._lux_listener_thread, daemon=True)
         self._listener_thread.start()
+
+    def _weather_updater_thread(self):
+        """백그라운드에서 30분마다 Open-Meteo API를 호출하여 실시간 날씨를 업데이트합니다."""
+        # 서울 위도/경도
+        url = "https://api.open-meteo.com/v1/forecast?latitude=37.5665&longitude=126.9780&current_weather=true"
+        while True:
+            try:
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    weather_code = data.get("current_weather", {}).get("weathercode", 0)
+                    
+                    # WMO 날씨 코드를 시스템 상태 문자열로 변환합니다.
+                    if weather_code in [0, 1]:  # 0: 맑음, 1: 대체로 맑음
+                        self.current_weather = "Clear"
+                    elif weather_code in [2, 3, 45, 48]:  # 2: 부분 흐림, 3: 흐림, 45/48: 안개
+                        self.current_weather = "Cloudy"
+                    else:  # 그 외 비, 눈, 뇌우 등
+                        self.current_weather = "Rain"
+                        
+                    print(f"[CircadianEngine] 날씨 업데이트 성공: {self.current_weather} (코드: {weather_code})")
+                else:
+                    print(f"[CircadianEngine] 날씨 API 호출 실패 (상태 코드: {response.status_code}). 기존 날씨({self.current_weather})를 유지합니다.")
+            except Exception as e:
+                print(f"[CircadianEngine] 날씨 통신 중 오류 발생: {e}. 30분 후 재시도합니다.")
+            
+            # 30분(1800초) 대기 후 다음 업데이트 진행
+            time.sleep(1800)
 
     def _lux_listener_thread(self):
         """백그라운드에서 센서(Raspberry Pi)로부터 UDP 조도 데이터를 수신하여 업데이트합니다."""
@@ -117,11 +153,15 @@ class CircadianEngine:
             return -5  # 실제가 목표보다 밝으면 5% 감소
         return 0
 
-    def get_base_lighting(self, current_time=None, current_lux=None, weather="Clear", current_wiz_percent=50):
+    def get_base_lighting(self, current_time=None, current_lux=None, weather=None, current_wiz_percent=50):
         """현재 시간에 맞는 각 조명 구역(Main, Indirect, Task)의 목표 조도와 색온도를 반환합니다."""
         # 외부에서 조도값이 명시되지 않았다면 실시간 수집된 값을 사용합니다.
         if current_lux is None:
             current_lux = self.current_lux
+
+        # 외부에서 날씨가 명시되지 않았다면 실시간 수집된(캐싱된) 날씨를 사용합니다.
+        if weather is None:
+            weather = self.current_weather
 
         # 시간 값이 안 들어오면 현재 시간을 기준으로 설정합니다.
         if current_time is None:
@@ -146,7 +186,9 @@ class CircadianEngine:
         # =========================================================
         # 1. 기상 구간 (Sunrise/06:30 ~ 10:00)
         # =========================================================
+        phase = ""
         if start_time <= current_time < time_10_00:
+            phase = "MORNING"
             duration = (time_10_00 - start_time).total_seconds()
             elapsed = (current_time - start_time).total_seconds()
             progress = elapsed / duration # 진행률 0.0 ~ 1.0
@@ -168,6 +210,7 @@ class CircadianEngine:
         # 2. 주간 구간 (10:00 ~ 일몰/18:00)
         # =========================================================
         elif time_10_00 <= current_time < dimming_time:
+            phase = "DAY"
             main_lux = indirect_lux = 500.0
             
             # 10:00 ~ 10:30 사이에는 색온도가 6000K에서 5000K로 떨어집니다.
@@ -185,6 +228,7 @@ class CircadianEngine:
         # 3. 저녁 구간 (일몰/18:00 ~ 22:00)
         # =========================================================
         elif dimming_time <= current_time < time_22_00:
+            phase = "EVENING"
             duration = (time_22_00 - dimming_time).total_seconds()
             elapsed = (current_time - dimming_time).total_seconds()
             overall_progress = elapsed / duration
@@ -207,6 +251,7 @@ class CircadianEngine:
         # 4. 심야 구간 (22:00 ~ 다음날 기상)
         # =========================================================
         else:
+            phase = "NIGHT"
             indirect_lux = 50.0
             main_lux = 0.0
             cct = 2700
@@ -232,7 +277,8 @@ class CircadianEngine:
             },
             "feedback": {
                 "wiz_step_percent": feedback_step
-            }
+            },
+            "phase": phase
         }
 
 if __name__ == "__main__":
@@ -260,7 +306,8 @@ if __name__ == "__main__":
     
     for t in test_times:
         print(f"--- Time: {t.strftime('%H:%M')} ---")
-        res = engine.get_base_lighting(current_time=t, current_lux=300, weather="Clear")
+        # weather=None을 전달하여 자동 갱신된 실시간 날씨를 사용하도록 합니다.
+        res = engine.get_base_lighting(current_time=t, current_lux=300, weather=None)
         print(f"Main:     Lux={res['zones']['main']['target_lux']:3d}, CCT={res['zones']['main']['target_cct']}K")
         print(f"Indirect: Lux={res['zones']['indirect']['target_lux']:3d}, CCT={res['zones']['indirect']['target_cct']}K")
         print(f"Task:     Lux={res['zones']['task']['target_lux']:3d}, CCT={res['zones']['task']['target_cct']}K")
