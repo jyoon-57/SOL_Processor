@@ -6,6 +6,7 @@ import numpy as np
 import time
 import math
 from collections import deque
+import threading
 
 # ==============================================================================
 # [설정 및 초기화]
@@ -68,7 +69,8 @@ ACTION_MAPPER = {
     "texting": "READ",
     "using computer": "WORK",
     "assembling computer": "WORK",
-    "waxing legs": "LIE DOWN"
+    "waxing legs": "LIE DOWN",
+    "stretching leg": "LIE DOWN"
 }
 
 # 시스템 상태 변수
@@ -115,6 +117,35 @@ def calculate_movement_delta(prev_marks, curr_marks):
     return total_delta
 
 # ==============================================================================
+# [무 버퍼링(Zero-Latency) 비디오 캡처 클래스]
+# ==============================================================================
+class VideoCaptureThreading:
+    def __init__(self, src):
+        # UDP 스트림 소스 연결
+        self.cap = cv2.VideoCapture(src)
+        self.ret, self.frame = self.cap.read()
+        self.running = True
+        
+        # 메인 프로세스와 독립적으로 영상을 계속 읽어 버퍼를 비우는 스레드 시작
+        self.thread = threading.Thread(target=self.update, daemon=True)
+        self.thread.start()
+
+    def update(self):
+        while self.running:
+            if self.cap.isOpened():
+                # 버퍼에 프레임이 쌓이지 않도록 끊임없이 읽어들여 최신 상태로 덮어쓰기
+                self.ret, self.frame = self.cap.read()
+
+    def read(self):
+        # 메인 프로세스는 언제든 호출하여 '가장 최신'의 프레임만 빼간다.
+        return self.ret, self.frame
+        
+    def stop(self):
+        self.running = False
+        self.thread.join()
+        self.cap.release()
+
+# ==============================================================================
 # [객체지향 리팩토링 - ActionRecognizer 클래스]
 # ==============================================================================
 
@@ -144,8 +175,12 @@ class ActionRecognizer:
         self.prev_time = 0
 
     def start_camera(self):
-        print("카메라 연동 완료. 움직임 분석을 시작합니다.")
-        cap = cv2.VideoCapture(1)
+        print("카메라 연동 완료. 라즈베리 파이 스트림 분석을 시작합니다.")
+        # 웹캠(0) 대신 라즈베리 파이에서 쏘는 UDP 스트림 주소 지정
+        udp_stream_url = "udp://0.0.0.0:5555"
+        
+        # 기본 VideoCapture 대신 새로 만든 무 버퍼링 클래스 적용
+        cap = VideoCaptureThreading(udp_stream_url) 
         return cap
         
     def get_action(self, cap):
@@ -181,6 +216,19 @@ class ActionRecognizer:
             # 이전 화면과 비교하여 움직임 변화량(Delta)을 계산
             delta = calculate_movement_delta(self.previous_landmarks, curr_landmarks)
             self.previous_landmarks = curr_landmarks
+            
+        else:
+            # [신규 로직] 화면에 사람이 없을 경우의 처리
+            # 터미널 도배를 방지하기 위해, 상태가 변하는 최초 1회만 출력
+            if self.last_known_action != "NO_HUMAN":
+                self.last_known_action = "NO_HUMAN"
+                self.display_action = "NO HUMAN DETECTED"
+                print("-- [사용자 미확인] 화면에 사용자가 없습니다.")
+                
+                # 진행 중이던 분석이 있다면 즉시 취소하고 초기화
+                self.current_state = STATE_STABLE
+                self.frame_buffer.clear()
+                self.previous_landmarks = None
             
         # [상태 전이 로직]
         if self.current_state == STATE_STABLE and delta > MOVEMENT_THRESHOLD:
@@ -241,8 +289,9 @@ class ActionRecognizer:
                             self.display_action = mapped_action
                             print(f">> [상태 전환] '{max_raw_action}' -> '{mapped_action}' (정확도: {max_raw_prob:.2f})")
                         else:
+                            self.last_known_action = "None"
                             self.display_action = f"IGNORE({max_raw_action})"
-                            print(f"-- [판단 보류] 무시된 행동 감지: '{max_raw_action}' (정확도: {max_raw_prob:.2f}). 기존 조명 제어 상태 유지.")
+                            print(f"-- [행동 이탈] 무시된 행동 감지: '{max_raw_action}' (정확도: {max_raw_prob:.2f}). 기본 조명 상태로 복귀합니다.")
                     else:
                         print(f"-- [판단 보류] 정확도 미달 ({max_raw_prob:.2f} < {CONFIDENCE_THRESHOLD}). 기존 상태 유지.")
                 
